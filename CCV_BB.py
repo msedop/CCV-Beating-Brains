@@ -9,6 +9,8 @@ import os
 import matplotlib as plt
 import matplotlib.pyplot as plt
 import matplotlib.cm as cm
+import matplotlib.dates as mdates
+from datetime import datetime, timedelta, time as dtime
 
 import mne
 from mne.datasets import misc
@@ -39,6 +41,7 @@ import networkx as nx
 from collections import defaultdict
 
 from datetime import datetime
+from datetime import time as dtime
 from datetime import timedelta
 from mne.time_frequency import tfr_array_morlet
 
@@ -46,32 +49,181 @@ from mne.datasets import ssvep
 import asrpy
 from asrpy import ASR
 
+
+
+def time_to_seconds(t):
+    if isinstance(t, datetime.time):
+        return t.hour * 3600 + t.minute * 60 + t.second + t.microsecond / 1e6
+    elif pd.isna(t):
+        return None  # or 0, depending on how you want to handle NaN
+    else:
+        return t  # already numeric or something else
+
+
 plt.close("all")
 
-edf_path = r"C:\Users\msedo\Documents\CCV - Beating Brains\CCV EEG\20250611_095543_438.EEG_5c0895de-0e46-4267-9ad3-ed14a72538bb.edf"
+# --- Load Data ---
+param_df = pd.read_excel(r"C:\Users\msedo\Documents\Beating Brains\Datos Anestesia\2068049_06_11_2025.xlsx")
+param_df.columns = param_df.columns.str.strip()
+
+edf_path = r"C:\Users\msedo\Documents\Beating Brains\CCV EEG\2068049_06_11_2025\EEG Data\20251106_105958_863.EEG_5c0895de-0e46-4267-9ad3-ed14a72538bb.edf"
+
+# ======================== Anestesia data ===============================
+
+rel_params = ['Unnamed: 1', 'inSev', 'etSev', 'xMAC']
+
+# Select only the relevant parameters (columns)
+rel_df = param_df[rel_params].copy()
+
+# Rename 'Unnamed: 1' to 'Time'
+rel_df = rel_df.rename(columns={'Unnamed: 1': 'Time'})
+
+rel_df['Time'] = rel_df['Time'].apply(time_to_seconds)
+
+
+print(rel_df.head())
+
+
+
 
 # Load the EDF file
 raw = mne.io.read_raw_edf(edf_path, preload=True)
 
+eeg_times = raw.times # np.array, in seconds
+
+# Choose EEG channel(s) or average if desired
+eeg_data = raw.get_data()  # shape: (n_channels, n_times)
+# Example: first channel
+eeg_ch = eeg_data[0]
+
 # Print basic info
 print(raw.info)
 
-channels = raw.info['ch_names'][:20]
-
+channels = raw.info['ch_names']
 
 sfreq = raw.info['sfreq']
-
-# Plot with time in minutes
-#raw.plot(time_format='%M:%S')  # Minutes:Seconds format
-
-
 
 # --- Plot (shows vertical lines at H:M:S points) ---
 raw.plot(time_format='%H:%M:%S')
 
-montage = mne.channels.make_standard_montage('standard_1020')
-raw.set_montage(montage, on_missing='ignore')
+# montage = mne.channels.make_standard_montage('standard_1020')
+# raw.set_montage(montage, on_missing='ignore')
 
+
+# Get EDF start datetime robustly
+edf_meas = raw.info.get('meas_date', None)
+if edf_meas is None:
+    raise RuntimeError("EDF measurement start date (raw.info['meas_date']) not found. "
+                       "If the EDF has no start time, provide the date/time to align to.")
+# handle float (timestamp) or datetime
+if isinstance(edf_meas, (float, int, np.floating, np.integer)):
+    edf_start = datetime.utcfromtimestamp(float(edf_meas))
+elif isinstance(edf_meas, datetime):
+    edf_start = edf_meas
+else:
+    # fallback try pandas
+    edf_start = pd.to_datetime(edf_meas)
+    if pd.isna(edf_start):
+        raise RuntimeError("Couldn't parse raw.info['meas_date']: " + repr(edf_meas))
+
+# Build EEG datetime index
+eeg_times = raw.times  # seconds from start (numpy array)
+eeg_dt = pd.to_datetime(edf_start) + pd.to_timedelta(eeg_times, unit='s')
+
+# Convert rel_df['Time'] to datetimes aligned to the EDF date
+td = rel_df['Time']
+
+def convert_time_column(series, reference_date):
+    # If numeric -> treat as seconds from start
+    if np.issubdtype(series.dtype, np.number):
+        return pd.to_datetime(reference_date) + pd.to_timedelta(series.astype(float), unit='s')
+
+    # Try to parse strings / Timestamp-like
+    parsed = pd.to_datetime(series, errors='coerce')  # may produce NaT for datetime.time objects
+
+    # Handle entries that were datetime.time objects (pd.to_datetime yields NaT), or items that are python datetime.time
+    mask_timeobj = series.apply(lambda x: isinstance(x, dtime))
+    if mask_timeobj.any():
+        parsed.loc[mask_timeobj] = series[mask_timeobj].apply(
+            lambda t: datetime.combine(reference_date.date(), t)
+        )
+
+    # For parsed timestamps that have year 1900 (pd.to_datetime parsed "10:23:00" -> 1900-01-01 10:23:00),
+    # replace the date with the EDF date:
+    def replace_1900(ts):
+        if pd.isna(ts):
+            return ts
+        if ts.year == 1900:
+            return ts.replace(year=reference_date.year, month=reference_date.month, day=reference_date.day)
+        return ts
+
+    parsed = parsed.apply(replace_1900)
+
+    # If still NaT, try interpreting as seconds (float-like strings)
+    still_nat = parsed.isna()
+    if still_nat.any():
+        try_as_float = pd.to_numeric(series[still_nat], errors='coerce')
+        if not try_as_float.isna().all():
+            parsed.loc[still_nat] = pd.to_datetime(reference_date) + pd.to_timedelta(try_as_float.fillna(0).astype(float), unit='s')
+
+    return parsed
+
+rel_dt = convert_time_column(td, edf_start)
+rel_df = rel_df.copy()
+rel_df['DateTime'] = rel_dt
+
+# Drop rows with invalid DateTime
+if rel_df['DateTime'].isna().any():
+    # either drop or warn; here we'll drop
+    rel_df = rel_df.dropna(subset=['DateTime']).reset_index(drop=True)
+
+# Limit to first 20 minutes
+time_limit_dt = edf_start + timedelta(minutes=20)
+eeg_mask = eeg_dt <= time_limit_dt
+param_mask = rel_df['DateTime'] <= time_limit_dt
+
+# Plot with HH:MM:SS x-axis
+fig, axs = plt.subplots(4, 1, figsize=(15, 10), sharex=True)
+
+# EEG (use datetime index)
+axs[0].plot(eeg_dt[eeg_mask], eeg_ch[eeg_mask], color='black', linewidth=0.5)
+axs[0].set_ylabel('EEG')
+axs[0].grid(True, alpha=0.3)
+
+# Anesthesia params: ['inSev', 'etSev', 'xMAC']
+params = ['inSev', 'etSev', 'xMAC']
+for i, col in enumerate(params):
+    if col not in rel_df.columns:
+        axs[i+1].text(0.5, 0.5, f"Column '{col}' not found", transform=axs[i+1].transAxes,
+                      ha='center', va='center', fontsize=12, color='red')
+        axs[i+1].set_ylabel(col)
+        continue
+    axs[i+1].plot(rel_df.loc[param_mask, 'DateTime'], rel_df.loc[param_mask, col], marker='.', linestyle='-', markersize=3)
+    axs[i+1].set_ylabel(col)
+    axs[i+1].grid(True, alpha=0.3)
+
+# Format x-axis as HH:MM:SS
+locator = mdates.AutoDateLocator()
+formatter = mdates.DateFormatter('%H:%M:%S')
+axs[-1].xaxis.set_major_locator(locator)
+axs[-1].xaxis.set_major_formatter(formatter)
+plt.setp(axs[-1].xaxis.get_majorticklabels(), rotation=30, ha='right')
+
+# Set overall x-limits to EDF start -> 20 minutes later
+axs[-1].set_xlim(edf_start, time_limit_dt)
+
+axs[-1].set_xlabel('Time (HH:MM:SS)')
+plt.tight_layout()
+plt.show()
+
+# ======================== Decimation ============================
+
+# Decimate the signals from 20000 Hz to 5000 Hz
+target_fs = 500
+raw.resample(sfreq=target_fs)
+# Define new sampling frequency
+sfreq = raw.info['sfreq']
+    
 
 # Compute and plot PSD
 fig = raw.compute_psd(tmax=np.inf, fmax=250).plot(
